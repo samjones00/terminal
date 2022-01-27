@@ -1408,9 +1408,10 @@ void AtlasEngine::_emplaceGlyph(IDWriteFontFace* fontFace, size_t bufferPos1, si
     auto attributes = _api.attributes;
     attributes.cellCount = cellCount;
 
-    const auto [it, inserted] = _r.glyphs.emplace(std::piecewise_construct, std::forward_as_tuple(attributes, gsl::narrow<u16>(charCount), chars), std::forward_as_tuple());
-    const auto& key = it->first;
-    auto& value = it->second;
+    bool inserted;
+    auto& it = _r.glyphs.emplace(AtlasKey{ attributes, gsl::narrow<u16>(charCount), chars }, inserted);
+    const auto& key = it.key;
+    auto& value = it.value;
 
     if (inserted)
     {

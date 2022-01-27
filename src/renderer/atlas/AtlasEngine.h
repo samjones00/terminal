@@ -171,6 +171,12 @@ namespace Microsoft::Console::Render
         };
 
     private:
+        struct initialized_t
+        {
+        };
+
+        static constexpr initialized_t initialized{};
+
         template<typename T, size_t Alignment = alignof(T)>
         struct Buffer
         {
@@ -180,6 +186,13 @@ namespace Microsoft::Console::Render
                 _data{ allocate(size) },
                 _size{ size }
             {
+            }
+
+            explicit Buffer(initialized_t, size_t size) :
+                _data{ allocate(size) },
+                _size{ size }
+            {
+                new (_data) T[_size];
             }
 
             Buffer(const T* data, size_t size) :
@@ -313,10 +326,10 @@ namespace Microsoft::Console::Render
             {
                 if (this != &other)
                 {
-                    delete this;
+                    ~SmallObjectOptimizer();
                     new (this) SmallObjectOptimizer(other);
                 }
-                return &this;
+                return *this;
             }
 
             SmallObjectOptimizer(SmallObjectOptimizer&& other) noexcept
@@ -332,7 +345,7 @@ namespace Microsoft::Console::Render
 
             ~SmallObjectOptimizer()
             {
-                if (!is_inline())
+                if (is_heapd())
                 {
 #pragma warning(suppress : 26408) // Avoid malloc() and free(), prefer the nothrow version of new with delete (r.10).
                     free(allocated);
@@ -341,36 +354,38 @@ namespace Microsoft::Console::Render
 
             T* initialize(size_t byteSize)
             {
-                if (would_inline(byteSize))
+                if (!would_heap(byteSize))
                 {
                     return &inlined;
                 }
 
 #pragma warning(suppress : 26408) // Avoid malloc() and free(), prefer the nothrow version of new with delete (r.10).
-                allocated = THROW_IF_NULL_ALLOC(static_cast<T*>(malloc(byteSize)));
+                const auto size = (byteSize + sizeof(ptrdiff_t) - 1) & ~(sizeof(ptrdiff_t) - 1);
+                allocated = THROW_IF_NULL_ALLOC(static_cast<T*>(malloc(size)));
+                memset(allocated, 0, size);
                 return allocated;
             }
 
-            constexpr bool would_inline(size_t byteSize) const noexcept
+            constexpr bool would_heap(size_t byteSize) const noexcept
             {
-                return byteSize <= sizeof(T);
+                return byteSize > sizeof(T);
             }
 
-            bool is_inline() const noexcept
+            bool is_heapd() const noexcept
             {
                 // VSO-1430353: __builtin_bitcast crashes the compiler under /permissive-. (BODGY)
 #pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1).
-                return (reinterpret_cast<uintptr_t>(allocated) & 1) != 0;
+                return (reinterpret_cast<uintptr_t>(allocated) & 1) == 0;
             }
 
             const T* data() const noexcept
             {
-                return is_inline() ? &inlined : allocated;
+                return is_heapd() ? allocated : &inlined;
             }
 
             size_t size() const noexcept
             {
-                return is_inline() ? sizeof(inlined) : _msize(allocated);
+                return is_heapd() ? _msize(allocated) : sizeof(inlined);
             }
         };
 
@@ -393,7 +408,7 @@ namespace Microsoft::Console::Render
         enum class CellFlags : u32
         {
             None            = 0x00000000,
-            Inlined         = 0x00000001,
+            Heapd           = 0x00000001,
 
             ColoredGlyph    = 0x00000002,
 
@@ -423,7 +438,7 @@ namespace Microsoft::Console::Render
 
         struct AtlasKeyAttributes
         {
-            u16 inlined : 1;
+            u16 heapd : 1;
             u16 bold : 1;
             u16 italic : 1;
             u16 cellCount : 13;
@@ -431,7 +446,7 @@ namespace Microsoft::Console::Render
             ATLAS_POD_OPS(AtlasKeyAttributes)
         };
 
-        struct AtlasKeyData
+        struct alignas(u32) AtlasKeyData
         {
             AtlasKeyAttributes attributes;
             u16 charCount;
@@ -440,11 +455,13 @@ namespace Microsoft::Console::Render
 
         struct AtlasKey
         {
+            constexpr AtlasKey() = default;
+
             AtlasKey(AtlasKeyAttributes attributes, u16 charCount, const wchar_t* chars)
             {
                 const auto size = dataSize(charCount);
                 const auto data = _data.initialize(size);
-                attributes.inlined = _data.would_inline(size);
+                attributes.heapd = _data.would_heap(size);
                 data->attributes = attributes;
                 data->charCount = charCount;
                 memcpy(&data->chars[0], chars, static_cast<size_t>(charCount) * sizeof(AtlasKeyData::chars[0]));
@@ -455,11 +472,22 @@ namespace Microsoft::Console::Render
                 return _data.data();
             }
 
-            size_t hash() const noexcept
+            u32 hash() const noexcept
             {
-                const auto d = data();
+                const auto d = _data.data();
 #pragma warning(suppress : 26490) // Don't use reinterpret_cast (type.1).
-                return std::_Fnv1a_append_bytes(std::_FNV_offset_basis, reinterpret_cast<const u8*>(d), dataSize(d->charCount));
+                auto beg = reinterpret_cast<const u32*>(d);
+                const auto end = beg + _data.size() / sizeof(u32);
+
+                auto h = UINT64_C(0xcafef00dd15ea5e5);
+                for (; beg != end; ++beg)
+                {
+                    h = (h ^ *beg) * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+                }
+
+                const int r = h & 63;
+                const auto x = u32(h >> 32) ^ u32(h);
+                return _rotl(x, r);
             }
 
             bool operator==(const AtlasKey& rhs) const noexcept
@@ -504,7 +532,7 @@ namespace Microsoft::Console::Render
             {
                 const auto size = dataSize(cellCount);
                 const auto data = _data.initialize(size);
-                WI_SetFlagIf(flags, CellFlags::Inlined, _data.would_inline(size));
+                WI_SetFlagIf(flags, CellFlags::Heapd, _data.would_heap(size));
                 data->flags = flags;
                 return &data->coords[0];
             }
@@ -521,6 +549,99 @@ namespace Microsoft::Console::Render
             {
                 return sizeof(AtlasValueData) - sizeof(AtlasValueData::coords) + static_cast<size_t>(coordCount) * sizeof(AtlasValueData::coords[0]);
             }
+        };
+
+        struct AtlasPair
+        {
+            AtlasPair* next = nullptr;
+            u32 hash = 0;
+            AtlasKey key;
+            AtlasValue value;
+        };
+
+        struct BoringHashset
+        {
+            AtlasPair& emplace(AtlasKey&& key, bool& inserted)
+            {
+                if (size > 64)
+                {
+                }
+                else if (size > entries.size() / 2)
+                {
+                    std::vector<AtlasPair> newEntries{ entries.size() * 2 };
+                    const auto newMask = (mask << 1) | 1;
+                    AtlasPair* tail = nullptr;
+                    AtlasPair* prev = nullptr;
+
+                    for (auto& it : entries)
+                    {
+                        if (it.key.data()->charCount != 0)
+                        {
+                            for (auto i = it.hash;; ++i)
+                            {
+                                const auto target = &newEntries[i & newMask];
+                                if (target->key.data()->charCount == 0)
+                                {
+                                    *target = std::move_if_noexcept(it);
+                                    if (!tail)
+                                    {
+                                        tail = target;
+                                    }
+                                    if (prev)
+                                    {
+                                        prev->next = target;
+                                    }
+                                    prev = target;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    tail = prev;
+                    entries = std::move(newEntries);
+                    mask = newMask;
+                }
+
+                const auto hash = key.hash();
+                AtlasPair* it;
+
+                for (auto i = hash;; ++i)
+                {
+                    it = &entries[i & mask];
+                    const auto d = it->key.data();
+                    if (it->key == key)
+                    {
+                        inserted = false;
+                        break;
+                    }
+                    if (d->charCount == 0)
+                    {
+                        it->key = std::move(key);
+                        size++;
+                        inserted = true;
+                        break;
+                    }
+                }
+
+                if (!tail)
+                {
+                    tail = it;
+                }
+                if (head)
+                {
+                    head->next = it;
+                }
+                head = it;
+                return *it;
+            }
+
+        private:
+            AtlasPair* tail = nullptr;
+            AtlasPair* head = nullptr;
+            std::vector<AtlasPair> entries{ 64 };
+            size_t size = 0;
+            u32 mask = 63;
         };
 
         struct AtlasQueueItem
@@ -628,7 +749,7 @@ namespace Microsoft::Console::Render
 
         static constexpr bool debugGlyphGenerationPerformance = false;
         static constexpr bool debugGeneralPerformance = false || debugGlyphGenerationPerformance;
-        static constexpr bool continuousRedraw = false || debugGeneralPerformance;
+        static constexpr bool continuousRedraw = true || debugGeneralPerformance;
 
         static constexpr u16 u16min = 0x0000;
         static constexpr u16 u16max = 0xffff;
@@ -690,7 +811,7 @@ namespace Microsoft::Console::Render
             u16x2 atlasSizeInPixelLimit; // invalidated by ApiInvalidations::Font
             u16x2 atlasSizeInPixel; // invalidated by ApiInvalidations::Font
             u16x2 atlasPosition;
-            std::unordered_map<AtlasKey, AtlasValue, AtlasKeyHasher> glyphs;
+            BoringHashset glyphs;
             std::vector<AtlasQueueItem> glyphQueue;
 
             f32 gamma = 0;
